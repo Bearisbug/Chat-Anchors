@@ -1,5 +1,6 @@
 (() => {
   const PANEL_ID = 'chat-anchors-panel';
+  const EDGE_LAYER_ID = 'chat-anchors-edge-layer';
   const STORAGE_KEY = 'chat_anchors_state_v1';
   const PREVIEW_CHARS = 5;
   const MAX_VISIBLE = 5;
@@ -12,11 +13,30 @@
   const MIN_PANEL_WIDTH = 200;
   const MIN_PANEL_HEIGHT = 220;
   const DRAG_THRESHOLD = 4;
+  const EDGE_THRESHOLD = 16;
+  const EDGE_HOVER_THRESHOLD = 48;
+  const EDGE_GAP = 8;
+  const EDGE_DEFAULT = 'right';
+  const EDGE_ROTATION = {
+    right: 0,
+    bottom: 90,
+    left: 180,
+    top: -90
+  };
+  const EDGE_OPPOSITE = {
+    left: 'right',
+    right: 'left',
+    top: 'bottom',
+    bottom: 'top'
+  };
 
   const DEFAULT_STATE = {
     removedByConversation: {},
     panelPosition: null,
-    panelSize: null
+    panelSize: null,
+    panelCollapsed: false,
+    panelCollapsedEdge: EDGE_DEFAULT,
+    panelDockRect: null
   };
 
   let state = { ...DEFAULT_STATE };
@@ -28,6 +48,13 @@
   let lastHighlighted = null;
   let selectedAnchorId = '';
   let listRef = null;
+  let edgeSyncRaf = null;
+  let edgeSyncTimer = null;
+  const pointerState = {
+    x: 0,
+    y: 0,
+    active: false
+  };
   const wheelState = {
     list: null,
     wrap: null,
@@ -137,6 +164,318 @@
 
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
+  }
+
+  function getNearestEdge(rect) {
+    const distances = {
+      left: rect.left,
+      right: window.innerWidth - rect.right,
+      top: rect.top,
+      bottom: window.innerHeight - rect.bottom
+    };
+    let edge = EDGE_DEFAULT;
+    let distance = distances[edge];
+    Object.keys(distances).forEach((key) => {
+      const value = distances[key];
+      if (value < distance) {
+        distance = value;
+        edge = key;
+      }
+    });
+    return { edge, distance };
+  }
+
+  function getOppositeEdge(edge) {
+    return EDGE_OPPOSITE[edge] || EDGE_DEFAULT;
+  }
+
+  function getPanelRect(panel) {
+    const rect = panel.getBoundingClientRect();
+    const left = parseFloat(panel.style.left);
+    const top = parseFloat(panel.style.top);
+    const width = parseFloat(panel.style.width);
+    const height = parseFloat(panel.style.height);
+    const resolvedLeft = Number.isNaN(left) ? rect.left : left;
+    const resolvedTop = Number.isNaN(top) ? rect.top : top;
+    const resolvedWidth = Number.isNaN(width) ? rect.width : width;
+    const resolvedHeight = Number.isNaN(height) ? rect.height : height;
+    return {
+      left: resolvedLeft,
+      top: resolvedTop,
+      width: resolvedWidth,
+      height: resolvedHeight,
+      right: resolvedLeft + resolvedWidth,
+      bottom: resolvedTop + resolvedHeight
+    };
+  }
+
+  function isPointerNearSide(rect, edge, x, y) {
+    const range = EDGE_HOVER_THRESHOLD;
+    if (edge === 'left') {
+      return Math.abs(x - rect.left) <= range && y >= rect.top - range && y <= rect.bottom + range;
+    }
+    if (edge === 'right') {
+      return Math.abs(x - rect.right) <= range && y >= rect.top - range && y <= rect.bottom + range;
+    }
+    if (edge === 'top') {
+      return Math.abs(y - rect.top) <= range && x >= rect.left - range && x <= rect.right + range;
+    }
+    if (edge === 'bottom') {
+      return Math.abs(y - rect.bottom) <= range && x >= rect.left - range && x <= rect.right + range;
+    }
+    return false;
+  }
+
+  function getDockRect(panel) {
+    const rect = getPanelRect(panel);
+    const stored = state.panelDockRect || {};
+    const left = typeof stored.x === 'number' ? stored.x : rect.left;
+    const top = typeof stored.y === 'number' ? stored.y : rect.top;
+    const width = typeof stored.width === 'number' ? stored.width : rect.width;
+    const height = typeof stored.height === 'number' ? stored.height : rect.height;
+    return {
+      left,
+      top,
+      width,
+      height
+    };
+  }
+
+  function ensureEdgeLayer() {
+    let layer = document.getElementById(EDGE_LAYER_ID);
+    if (layer) {
+      return layer;
+    }
+    layer = document.createElement('div');
+    layer.id = EDGE_LAYER_ID;
+    const icon = `
+      <svg class="chat-anchors-edge-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M8 5l8 7-8 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+    `;
+    layer.innerHTML = `
+      <button class="chat-anchors-edge-hide" type="button" aria-label="收起">${icon}</button>
+      <button class="chat-anchors-edge-show" type="button" aria-label="展开">${icon}</button>
+    `;
+    document.body.appendChild(layer);
+    return layer;
+  }
+
+  function syncEdgeLayer(panel) {
+    if (!panel) {
+      return;
+    }
+    const layer = ensureEdgeLayer();
+    if (!layer) {
+      return;
+    }
+    const isCollapsed = panel.dataset.collapsed === 'true';
+    const rect = getPanelRect(panel);
+    let left = rect.left;
+    let top = rect.top;
+    let width = rect.width;
+    let height = rect.height;
+    if (isCollapsed) {
+      const dockRect = getDockRect(panel);
+      const edge = panel.dataset.collapsedEdge || state.panelCollapsedEdge || EDGE_DEFAULT;
+      if (edge === 'left' || edge === 'right') {
+        width = 0;
+        height = dockRect.height;
+        top = clamp(dockRect.top, DRAG_MARGIN, window.innerHeight - dockRect.height - DRAG_MARGIN);
+        left = edge === 'right' ? window.innerWidth : 0;
+      } else {
+        width = dockRect.width;
+        height = 0;
+        left = clamp(dockRect.left, DRAG_MARGIN, window.innerWidth - dockRect.width - DRAG_MARGIN);
+        top = edge === 'bottom' ? window.innerHeight : 0;
+      }
+    }
+    layer.style.left = `${left}px`;
+    layer.style.top = `${top}px`;
+    layer.style.width = `${width}px`;
+    layer.style.height = `${height}px`;
+    layer.dataset.visible = panel.dataset.visible || 'false';
+    layer.dataset.nearEdge = panel.dataset.nearEdge || 'false';
+    layer.dataset.edge = panel.dataset.edge || EDGE_DEFAULT;
+    layer.dataset.collapsed = panel.dataset.collapsed || 'false';
+    layer.dataset.collapsedEdge = panel.dataset.collapsedEdge || state.panelCollapsedEdge || EDGE_DEFAULT;
+    layer.dataset.edgeHot = panel.dataset.edgeHot || 'false';
+    layer.dataset.dimmed = panel.classList.contains('is-dimmed') && panel.dataset.collapsed !== 'true' ? 'true' : 'false';
+    layer.dataset.dragging = panel.dataset.dragging === 'true' ? 'true' : 'false';
+  }
+
+  function updateEdgeButtons(panel) {
+    if (!panel) {
+      return;
+    }
+    const layer = ensureEdgeLayer();
+    if (!layer) {
+      return;
+    }
+    syncEdgeLayer(panel);
+    const hideButton = layer.querySelector('.chat-anchors-edge-hide');
+    const showButton = layer.querySelector('.chat-anchors-edge-show');
+    const edge = layer.dataset.edge || EDGE_DEFAULT;
+    const collapsedEdge = layer.dataset.collapsedEdge || state.panelCollapsedEdge || EDGE_DEFAULT;
+    if (hideButton) {
+      const rotation = EDGE_ROTATION[edge] || 0;
+      hideButton.style.setProperty('--edge-rotation', `${rotation}deg`);
+    }
+    const showEdge = getOppositeEdge(collapsedEdge);
+    if (showButton) {
+      const rotation = EDGE_ROTATION[showEdge] || 0;
+      showButton.style.setProperty('--edge-rotation', `${rotation}deg`);
+    }
+  }
+
+  function updateEdgeHint(panel) {
+    if (!panel) {
+      return;
+    }
+    if (panel.dataset.collapsed === 'true') {
+      panel.dataset.nearEdge = 'false';
+      setEdgeHot(panel, false);
+      updateEdgeButtons(panel);
+      return;
+    }
+    const rect = getPanelRect(panel);
+    const { edge, distance } = getNearestEdge(rect);
+    panel.dataset.edge = edge;
+    panel.dataset.nearEdge = distance <= EDGE_THRESHOLD ? 'true' : 'false';
+    const nextHot = pointerState.active ? isEdgeHot(panel, rect, pointerState.x, pointerState.y) : false;
+    setEdgeHot(panel, nextHot);
+    updateEdgeButtons(panel);
+  }
+
+  function isEdgeHot(panel, rect, x, y) {
+    if (!panel || panel.dataset.collapsed === 'true' || panel.dataset.nearEdge !== 'true') {
+      return false;
+    }
+    const edge = panel.dataset.edge || EDGE_DEFAULT;
+    const hideEdge = getOppositeEdge(edge);
+    return isPointerNearSide(rect, hideEdge, x, y);
+  }
+
+  function setEdgeHot(panel, next) {
+    const value = next ? 'true' : 'false';
+    if (panel.dataset.edgeHot !== value) {
+      panel.dataset.edgeHot = value;
+      return true;
+    }
+    return false;
+  }
+
+  function scheduleEdgeSync(panel) {
+    if (!panel) {
+      return;
+    }
+    if (edgeSyncRaf) {
+      cancelAnimationFrame(edgeSyncRaf);
+    }
+    edgeSyncRaf = requestAnimationFrame(() => {
+      edgeSyncRaf = null;
+      updateEdgeHint(panel);
+    });
+    if (edgeSyncTimer) {
+      clearTimeout(edgeSyncTimer);
+    }
+    edgeSyncTimer = setTimeout(() => {
+      edgeSyncTimer = null;
+      updateEdgeHint(panel);
+    }, 320);
+  }
+
+  function initEdgePointer(panel) {
+    if (!panel || panel.dataset.edgePointerReady === 'true') {
+      return;
+    }
+    panel.dataset.edgePointerReady = 'true';
+    document.addEventListener('pointermove', (event) => {
+      pointerState.x = event.clientX;
+      pointerState.y = event.clientY;
+      pointerState.active = true;
+      if (panel.dataset.visible !== 'true') {
+        return;
+      }
+      const rect = getPanelRect(panel);
+      const nextHot = isEdgeHot(panel, rect, pointerState.x, pointerState.y);
+      if (setEdgeHot(panel, nextHot)) {
+        updateEdgeButtons(panel);
+      }
+    });
+    window.addEventListener('blur', () => {
+      pointerState.active = false;
+      if (setEdgeHot(panel, false)) {
+        updateEdgeButtons(panel);
+      }
+    });
+  }
+
+  function applyCollapsedPosition(panel) {
+    if (!panel) {
+      return;
+    }
+    const rect = panel.getBoundingClientRect();
+    const edge = panel.dataset.collapsedEdge || state.panelCollapsedEdge || EDGE_DEFAULT;
+    let left = rect.left;
+    let top = rect.top;
+    if (edge === 'right') {
+      left = window.innerWidth - DRAG_MARGIN + EDGE_GAP;
+      top = clamp(rect.top, DRAG_MARGIN, window.innerHeight - rect.height - DRAG_MARGIN);
+    } else if (edge === 'left') {
+      left = DRAG_MARGIN - EDGE_GAP - rect.width;
+      top = clamp(rect.top, DRAG_MARGIN, window.innerHeight - rect.height - DRAG_MARGIN);
+    } else if (edge === 'top') {
+      left = clamp(rect.left, DRAG_MARGIN, window.innerWidth - rect.width - DRAG_MARGIN);
+      top = DRAG_MARGIN - EDGE_GAP - rect.height;
+    } else if (edge === 'bottom') {
+      left = clamp(rect.left, DRAG_MARGIN, window.innerWidth - rect.width - DRAG_MARGIN);
+      top = window.innerHeight - DRAG_MARGIN + EDGE_GAP;
+    }
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+  }
+
+  function setPanelCollapsed(panel, collapsed) {
+    if (!panel) {
+      return;
+    }
+    const isCollapsed = panel.dataset.collapsed === 'true';
+    if (collapsed === isCollapsed) {
+      return;
+    }
+    if (collapsed) {
+      const rect = panel.getBoundingClientRect();
+      state.panelDockRect = {
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height
+      };
+      panel.style.left = `${rect.left}px`;
+      panel.style.top = `${rect.top}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      savePanelPosition(panel);
+      const { edge } = getNearestEdge(rect);
+      const targetEdge = edge || EDGE_DEFAULT;
+      panel.dataset.collapsedEdge = targetEdge;
+      state.panelCollapsedEdge = targetEdge;
+      panel.dataset.collapsed = 'true';
+      state.panelCollapsed = true;
+      saveState();
+      applyCollapsedPosition(panel);
+    } else {
+      panel.dataset.collapsed = 'false';
+      state.panelCollapsed = false;
+      saveState();
+      applyPanelPosition(panel);
+    }
+    updateEdgeButtons(panel);
+    updateEdgeHint(panel);
+    scheduleEdgeSync(panel);
   }
 
   function getPreviewLimit(panel) {
@@ -643,6 +982,10 @@
       if (hiddenList) {
         updatePreviewText(panel, hiddenList);
       }
+      if (panel.dataset.collapsed === 'true') {
+        applyCollapsedPosition(panel);
+      }
+      updateEdgeHint(panel);
       savePanelSize(panel);
     });
     observer.observe(panel);
@@ -659,6 +1002,7 @@
         return;
       }
       panel.classList.toggle('is-dimmed', !focused);
+      updateEdgeButtons(panel);
     };
 
     panel.addEventListener('mouseenter', () => setFocused(true));
@@ -671,6 +1015,31 @@
     });
 
     setFocused(false);
+  }
+
+  function initEdgeControls(panel) {
+    if (panel.dataset.edgeReady === 'true') {
+      return;
+    }
+    panel.dataset.edgeReady = 'true';
+    const layer = ensureEdgeLayer();
+    if (!layer) {
+      return;
+    }
+    const hideButton = layer.querySelector('.chat-anchors-edge-hide');
+    const showButton = layer.querySelector('.chat-anchors-edge-show');
+    if (hideButton) {
+      hideButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        setPanelCollapsed(panel, true);
+      });
+    }
+    if (showButton) {
+      showButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        setPanelCollapsed(panel, false);
+      });
+    }
   }
 
   function initDrag(panel) {
@@ -699,6 +1068,7 @@
       const nextTop = clamp(startTop + (event.clientY - startY), DRAG_MARGIN, window.innerHeight - panelHeight - DRAG_MARGIN);
       panel.style.left = `${nextLeft}px`;
       panel.style.top = `${nextTop}px`;
+      updateEdgeHint(panel);
     };
 
     const endDrag = () => {
@@ -711,6 +1081,7 @@
       if (!panel.matches(':hover')) {
         panel.classList.add('is-dimmed');
       }
+      updateEdgeHint(panel);
       if (dragPointerId !== null) {
         try {
           handle.releasePointerCapture(dragPointerId);
@@ -728,6 +1099,9 @@
       if (event.button !== 0) {
         return;
       }
+      if (panel.dataset.collapsed === 'true') {
+        return;
+      }
       const rect = panel.getBoundingClientRect();
       panelWidth = rect.width;
       panelHeight = rect.height;
@@ -742,6 +1116,7 @@
       dragging = true;
       panel.dataset.dragging = 'true';
       panel.classList.remove('is-dimmed');
+      updateEdgeHint(panel);
       dragPointerId = event.pointerId;
       handle.setPointerCapture(event.pointerId);
       document.addEventListener('pointermove', onPointerMove, { passive: false });
@@ -905,6 +1280,19 @@
     let panel = document.getElementById(PANEL_ID);
     if (panel) {
       listRef = panel.querySelector('.chat-anchors-list');
+      panel.querySelectorAll('.chat-anchors-edge-hide, .chat-anchors-edge-show').forEach((el) => el.remove());
+      panel.dataset.nearEdge = panel.dataset.nearEdge || 'false';
+      panel.dataset.edge = panel.dataset.edge || state.panelCollapsedEdge || EDGE_DEFAULT;
+      panel.dataset.edgeHot = panel.dataset.edgeHot || 'false';
+      panel.dataset.collapsed = state.panelCollapsed ? 'true' : 'false';
+      panel.dataset.collapsedEdge = state.panelCollapsedEdge || EDGE_DEFAULT;
+      updateEdgeButtons(panel);
+      initEdgePointer(panel);
+      initEdgeControls(panel);
+      if (panel.dataset.collapsed === 'true') {
+        applyCollapsedPosition(panel);
+      }
+      updateEdgeHint(panel);
       return panel;
     }
 
@@ -925,6 +1313,12 @@
       <div class="chat-anchors-hidden-list" role="list" hidden></div>
     `;
     document.body.appendChild(panel);
+    panel.dataset.nearEdge = 'false';
+    panel.dataset.edge = state.panelCollapsedEdge || EDGE_DEFAULT;
+    panel.dataset.edgeHot = 'false';
+    panel.dataset.collapsed = state.panelCollapsed ? 'true' : 'false';
+    panel.dataset.collapsedEdge = state.panelCollapsedEdge || EDGE_DEFAULT;
+    updateEdgeButtons(panel);
 
     const toggle = panel.querySelector('.chat-anchors-hidden-toggle');
     const hiddenList = panel.querySelector('.chat-anchors-hidden-list');
@@ -942,20 +1336,29 @@
     if (list && listWrap) {
       initWheel(list, listWrap);
       initPanelFocus(panel);
+      initEdgePointer(panel);
+      initEdgeControls(panel);
       initDrag(panel);
       initResizeObserver(panel, list, listWrap);
       requestAnimationFrame(() => {
         applyPanelPosition(panel);
+        if (panel.dataset.collapsed === 'true') {
+          applyCollapsedPosition(panel);
+        }
         panel.classList.toggle('is-resized', Boolean(panel.style.width || panel.style.height));
         updateWheelPadding(list);
         updateWheelTransforms(list);
         updateFadeState(list, listWrap);
         updatePreviewText(panel, list);
+        updateEdgeHint(panel);
       });
       if (panel.dataset.resizeReady !== 'true') {
         panel.dataset.resizeReady = 'true';
         window.addEventListener('resize', () => {
           applyPanelPosition(panel);
+          if (panel.dataset.collapsed === 'true') {
+            applyCollapsedPosition(panel);
+          }
           updateWheelPadding(list);
           updateWheelTransforms(list);
           updateFadeState(list, listWrap);
@@ -964,6 +1367,7 @@
           if (hiddenList) {
             updatePreviewText(panel, hiddenList);
           }
+          updateEdgeHint(panel);
         });
       }
     }
@@ -1119,12 +1523,14 @@
     }
 
     panel.dataset.visible = 'true';
+    updateEdgeHint(panel);
   }
 
   function hidePanel() {
     const panel = document.getElementById(PANEL_ID);
     if (panel) {
       panel.dataset.visible = 'false';
+      updateEdgeButtons(panel);
     }
     hideTooltip();
   }
