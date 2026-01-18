@@ -17,6 +17,7 @@
   const EDGE_HOVER_THRESHOLD = 48;
   const EDGE_GAP = 8;
   const EDGE_DEFAULT = 'right';
+  const THEME_DEFAULT = 'dark';
   const SCROLL_SYNC_SMOOTH = true;
   const EDGE_ROTATION = {
     right: 0,
@@ -37,7 +38,8 @@
     panelSize: null,
     panelCollapsed: false,
     panelCollapsedEdge: EDGE_DEFAULT,
-    panelDockRect: null
+    panelDockRect: null,
+    theme: THEME_DEFAULT
   };
 
   let state = { ...DEFAULT_STATE };
@@ -94,6 +96,7 @@
             ...saved,
             removedByConversation: saved.removedByConversation || {}
           };
+          state.theme = normalizeTheme(state.theme);
         }
         resolve();
       });
@@ -190,6 +193,39 @@
 
   function getOppositeEdge(edge) {
     return EDGE_OPPOSITE[edge] || EDGE_DEFAULT;
+  }
+
+  function normalizeTheme(theme) {
+    return theme === 'light' ? 'light' : 'dark';
+  }
+
+  function applyTheme(panel, theme) {
+    const nextTheme = normalizeTheme(theme);
+    if (panel) {
+      panel.dataset.theme = nextTheme;
+    }
+    const layer = ensureEdgeLayer();
+    if (layer) {
+      layer.dataset.theme = nextTheme;
+    }
+    if (tooltipEl) {
+      tooltipEl.dataset.theme = nextTheme;
+    }
+  }
+
+  function setTheme(panel, theme) {
+    const nextTheme = normalizeTheme(theme);
+    if (state.theme === nextTheme && panel && panel.dataset.theme === nextTheme) {
+      return;
+    }
+    state.theme = nextTheme;
+    saveState();
+    applyTheme(panel, nextTheme);
+  }
+
+  function toggleTheme(panel) {
+    const current = normalizeTheme(state.theme);
+    setTheme(panel, current === 'dark' ? 'light' : 'dark');
   }
 
   function getPanelRect(panel) {
@@ -303,6 +339,7 @@
     layer.dataset.collapsed = panel.dataset.collapsed || 'false';
     layer.dataset.collapsedEdge = panel.dataset.collapsedEdge || state.panelCollapsedEdge || EDGE_DEFAULT;
     layer.dataset.edgeHot = panel.dataset.edgeHot || 'false';
+    layer.dataset.theme = panel.dataset.theme || state.theme || THEME_DEFAULT;
     layer.dataset.dimmed = panel.classList.contains('is-dimmed') && panel.dataset.collapsed !== 'true' ? 'true' : 'false';
     layer.dataset.dragging = panel.dataset.dragging === 'true' ? 'true' : 'false';
   }
@@ -602,10 +639,58 @@
     el.className = 'chat-anchors-tooltip';
     el.setAttribute('role', 'tooltip');
     el.dataset.visible = 'false';
+    el.dataset.theme = normalizeTheme(state.theme);
     el.hidden = true;
     document.body.appendChild(el);
     tooltipEl = el;
     return el;
+  }
+
+  function ensureThemeToggle(panel) {
+    if (!panel) {
+      return;
+    }
+    const header = panel.querySelector('.chat-anchors-header');
+    if (!header) {
+      return;
+    }
+    let right = header.querySelector('.chat-anchors-header-right');
+    const subtitle = header.querySelector('.chat-anchors-subtitle');
+    if (!right) {
+      right = document.createElement('div');
+      right.className = 'chat-anchors-header-right';
+      if (subtitle) {
+        right.appendChild(subtitle);
+      }
+      header.appendChild(right);
+    } else if (subtitle && subtitle.parentElement !== right) {
+      right.appendChild(subtitle);
+    }
+    let toggle = header.querySelector('.chat-anchors-theme-toggle');
+    if (!toggle) {
+      toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'chat-anchors-theme-toggle';
+      toggle.setAttribute('aria-label', '切换主题');
+      toggle.innerHTML = `
+<svg class="chat-anchors-theme-icon is-dark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+  <path fill="currentColor" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+</svg>
+
+<svg class="chat-anchors-theme-icon is-light" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+  <circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-width="2"></circle>
+  <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
+</svg>
+      `;
+      right.appendChild(toggle);
+    }
+    if (toggle.dataset.ready !== 'true') {
+      toggle.dataset.ready = 'true';
+      toggle.addEventListener('click', (event) => {
+        event.stopPropagation();
+        toggleTheme(panel);
+      });
+    }
   }
 
   function positionTooltip(anchorItem, tooltip) {
@@ -633,6 +718,36 @@
     tooltip.style.top = `${top}px`;
   }
 
+  function clampTooltipText(tooltip, fullText) {
+    if (!tooltip) {
+      return;
+    }
+    const text = fullText || '';
+    tooltip.textContent = text;
+    if (!text) {
+      return;
+    }
+    if (tooltip.scrollHeight <= tooltip.clientHeight) {
+      return;
+    }
+    let low = 0;
+    let high = text.length;
+    let best = 0;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const slice = text.slice(0, mid).trimEnd();
+      tooltip.textContent = slice ? `${slice}…` : '…';
+      if (tooltip.scrollHeight <= tooltip.clientHeight) {
+        best = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    const finalSlice = text.slice(0, best).trimEnd();
+    tooltip.textContent = finalSlice ? `${finalSlice}…` : '…';
+  }
+
   function showTooltip(anchorItem, text) {
     if (!text) {
       return;
@@ -647,6 +762,8 @@
     tooltip.hidden = false;
     tooltip.dataset.visible = 'true';
     requestAnimationFrame(() => {
+      positionTooltip(anchorItem, tooltip);
+      clampTooltipText(tooltip, text);
       positionTooltip(anchorItem, tooltip);
     });
   }
@@ -1162,6 +1279,9 @@
       if (event.button !== 0) {
         return;
       }
+      if (event.target.closest('.chat-anchors-theme-toggle')) {
+        return;
+      }
       if (panel.dataset.collapsed === 'true') {
         return;
       }
@@ -1349,6 +1469,8 @@
       panel.dataset.edgeHot = panel.dataset.edgeHot || 'false';
       panel.dataset.collapsed = state.panelCollapsed ? 'true' : 'false';
       panel.dataset.collapsedEdge = state.panelCollapsedEdge || EDGE_DEFAULT;
+      applyTheme(panel, state.theme || THEME_DEFAULT);
+      ensureThemeToggle(panel);
       updateEdgeButtons(panel);
       initEdgePointer(panel);
       initScrollSync(panel);
@@ -1382,6 +1504,8 @@
     panel.dataset.edgeHot = 'false';
     panel.dataset.collapsed = state.panelCollapsed ? 'true' : 'false';
     panel.dataset.collapsedEdge = state.panelCollapsedEdge || EDGE_DEFAULT;
+    applyTheme(panel, state.theme || THEME_DEFAULT);
+    ensureThemeToggle(panel);
     updateEdgeButtons(panel);
 
     const toggle = panel.querySelector('.chat-anchors-hidden-toggle');
