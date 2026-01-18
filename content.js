@@ -17,6 +17,7 @@
   const EDGE_HOVER_THRESHOLD = 48;
   const EDGE_GAP = 8;
   const EDGE_DEFAULT = 'right';
+  const SCROLL_SYNC_SMOOTH = true;
   const EDGE_ROTATION = {
     right: 0,
     bottom: 90,
@@ -50,6 +51,8 @@
   let listRef = null;
   let edgeSyncRaf = null;
   let edgeSyncTimer = null;
+  let scrollSyncRaf = null;
+  let visibleAnchorsRef = [];
   const pointerState = {
     x: 0,
     y: 0,
@@ -383,6 +386,66 @@
       edgeSyncTimer = null;
       updateEdgeHint(panel);
     }, 320);
+  }
+
+  function scheduleScrollSync() {
+    if (scrollSyncRaf) {
+      cancelAnimationFrame(scrollSyncRaf);
+    }
+    scrollSyncRaf = requestAnimationFrame(() => {
+      scrollSyncRaf = null;
+      syncPanelToScroll();
+    });
+  }
+
+  function syncPanelToScroll() {
+    if (!visibleAnchorsRef.length) {
+      return;
+    }
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel || panel.dataset.visible !== 'true') {
+      return;
+    }
+    if (panel.dataset.dragging === 'true' || wheelState.isPointerDown) {
+      return;
+    }
+    const viewportCenter = window.innerHeight / 2;
+    let closest = null;
+    let closestDistance = Number.POSITIVE_INFINITY;
+    visibleAnchorsRef.forEach((anchor) => {
+      if (!anchor || !anchor.scrollEl || typeof anchor.scrollEl.getBoundingClientRect !== 'function') {
+        return;
+      }
+      const rect = anchor.scrollEl.getBoundingClientRect();
+      const center = rect.top + rect.height / 2;
+      const distance = Math.abs(center - viewportCenter);
+      if (distance < closestDistance) {
+        closestDistance = distance;
+        closest = anchor;
+      }
+    });
+    if (!closest || !closest.id) {
+      return;
+    }
+    if (closest.id === selectedAnchorId) {
+      return;
+    }
+    setSelectedAnchorId(closest.id);
+    scrollListToAnchor(closest.id, !SCROLL_SYNC_SMOOTH);
+  }
+
+  function initScrollSync(panel) {
+    if (!panel || panel.dataset.scrollSyncReady === 'true') {
+      return;
+    }
+    panel.dataset.scrollSyncReady = 'true';
+    window.addEventListener('scroll', (event) => {
+      const target = event.target;
+      if (target && target.closest && target.closest(`#${PANEL_ID}`)) {
+        return;
+      }
+      scheduleScrollSync();
+    }, { passive: true, capture: true });
   }
 
   function initEdgePointer(panel) {
@@ -1288,6 +1351,7 @@
       panel.dataset.collapsedEdge = state.panelCollapsedEdge || EDGE_DEFAULT;
       updateEdgeButtons(panel);
       initEdgePointer(panel);
+      initScrollSync(panel);
       initEdgeControls(panel);
       if (panel.dataset.collapsed === 'true') {
         applyCollapsedPosition(panel);
@@ -1337,6 +1401,7 @@
       initWheel(list, listWrap);
       initPanelFocus(panel);
       initEdgePointer(panel);
+      initScrollSync(panel);
       initEdgeControls(panel);
       initDrag(panel);
       initResizeObserver(panel, list, listWrap);
@@ -1532,6 +1597,7 @@
       panel.dataset.visible = 'false';
       updateEdgeButtons(panel);
     }
+    visibleAnchorsRef = [];
     hideTooltip();
   }
 
@@ -1644,6 +1710,7 @@
     const removed = removedChanged ? cleanedRemoved : existingRemoved;
     const visibleAnchors = anchors.filter((anchor) => !removed[anchor.id]);
     const hiddenAnchors = anchors.filter((anchor) => removed[anchor.id]);
+    visibleAnchorsRef = visibleAnchors;
 
     const signature = `${conversationId}|${anchors.map((anchor) => anchor.id).join(',')}|${Object.keys(removed).join(',')}`;
     if (!force && signature === lastSignature) {
@@ -1656,6 +1723,7 @@
       hiddenAnchors,
       totalCount: anchors.length
     });
+    scheduleScrollSync();
   }
 
   function handleUrlChange() {

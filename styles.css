@@ -206,7 +206,7 @@
 }
 
 .chat-anchors-item.is-selected {
-  border-color: rgba(64, 196, 99, 0.5);
+  border-color: rgba(255, 255, 255, 0.481);
 }
 
 .chat-anchors-item.is-center .chat-anchors-text {
@@ -479,8 +479,6 @@
   backdrop-filter: blur(8px);
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
   max-width: 300px;
-  max-height: 240px;
-  overflow-y: auto;
   word-wrap: break-word;
   white-space: pre-wrap;
   opacity: 0;
