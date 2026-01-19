@@ -9,6 +9,11 @@
   const WHEEL_SPEED = 0.3;
   const WHEEL_MAX_VELOCITY = 180;
   const SETTLE_DELAY = 160;
+  const SCROLL_JUMP_SPEED = 0.5;
+  const SCROLL_JUMP_MIN_DURATION = 180;
+  const SCROLL_JUMP_MAX_DURATION = 520;
+  const SCROLL_TARGET_DRIFT = 6;
+  const SCROLL_TARGET_EPSILON = 1;
   const DRAG_MARGIN = 8;
   const MIN_PANEL_WIDTH = 200;
   const MIN_PANEL_HEIGHT = 220;
@@ -77,6 +82,16 @@
     hasCapture: false,
     settleTimer: null
   };
+  const scrollJumpState = {
+    rafId: null,
+    container: null,
+    anchorEl: null,
+    highlightEl: null,
+    startScroll: 0,
+    targetScroll: 0,
+    startTime: 0,
+    duration: 0
+  };
 
   const storage = (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local)
     ? chrome.storage.local
@@ -85,18 +100,28 @@
   function loadState() {
     return new Promise((resolve) => {
       if (!storage) {
+        state.theme = getSystemTheme();
         resolve();
         return;
       }
       storage.get(STORAGE_KEY, (data) => {
         const saved = data && data[STORAGE_KEY];
-        if (saved && typeof saved === 'object') {
+        const hasSaved = saved && typeof saved === 'object';
+        const savedTheme = hasSaved && typeof saved.theme === 'string'
+          ? normalizeTheme(saved.theme)
+          : '';
+        if (hasSaved) {
           state = {
             ...DEFAULT_STATE,
             ...saved,
             removedByConversation: saved.removedByConversation || {}
           };
-          state.theme = normalizeTheme(state.theme);
+        }
+        if (savedTheme) {
+          state.theme = savedTheme;
+        } else {
+          state.theme = getSystemTheme();
+          saveState();
         }
         resolve();
       });
@@ -197,6 +222,13 @@
 
   function normalizeTheme(theme) {
     return theme === 'light' ? 'light' : 'dark';
+  }
+
+  function getSystemTheme() {
+    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+      return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    return THEME_DEFAULT;
   }
 
   function applyTheme(panel, theme) {
@@ -790,6 +822,181 @@
 
   function getMaxScroll(list) {
     return Math.max(0, list.scrollHeight - list.clientHeight);
+  }
+
+  function getScrollRoot() {
+    return document.scrollingElement || document.documentElement;
+  }
+
+  function isPageScrollContainer(container) {
+    const root = getScrollRoot();
+    return container === root || container === document.body || container === document.documentElement;
+  }
+
+  function getScrollContainer(el) {
+    if (!el) {
+      return getScrollRoot();
+    }
+    let parent = el.parentElement;
+    while (parent && parent !== document.body && parent !== document.documentElement) {
+      const style = getComputedStyle(parent);
+      const overflowY = style.overflowY || style.overflow;
+      if ((overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay')
+        && parent.scrollHeight > parent.clientHeight + 1) {
+        return parent;
+      }
+      parent = parent.parentElement;
+    }
+    return getScrollRoot();
+  }
+
+  function getScrollTop(container) {
+    if (!container) {
+      return 0;
+    }
+    if (isPageScrollContainer(container)) {
+      const root = getScrollRoot();
+      return root ? root.scrollTop : 0;
+    }
+    return container.scrollTop;
+  }
+
+  function setScrollTop(container, value) {
+    if (!container) {
+      return;
+    }
+    if (isPageScrollContainer(container)) {
+      const root = getScrollRoot();
+      if (root) {
+        root.scrollTop = value;
+      }
+      return;
+    }
+    container.scrollTop = value;
+  }
+
+  function getContainerMaxScroll(container) {
+    if (!container) {
+      return 0;
+    }
+    if (isPageScrollContainer(container)) {
+      const root = getScrollRoot();
+      if (!root) {
+        return 0;
+      }
+      return Math.max(0, root.scrollHeight - window.innerHeight);
+    }
+    return Math.max(0, container.scrollHeight - container.clientHeight);
+  }
+
+  function getCenteredScrollTop(container, targetEl) {
+    if (!container || !targetEl) {
+      return 0;
+    }
+    const elementRect = targetEl.getBoundingClientRect();
+    const containerRect = isPageScrollContainer(container)
+      ? { top: 0, height: window.innerHeight }
+      : container.getBoundingClientRect();
+    const scrollTop = getScrollTop(container);
+    const elementTop = elementRect.top - containerRect.top + scrollTop;
+    const targetTop = elementTop - (containerRect.height - elementRect.height) / 2;
+    return clamp(targetTop, 0, getContainerMaxScroll(container));
+  }
+
+  function resetScrollJumpState() {
+    if (scrollJumpState.rafId) {
+      cancelAnimationFrame(scrollJumpState.rafId);
+    }
+    scrollJumpState.rafId = null;
+    scrollJumpState.container = null;
+    scrollJumpState.anchorEl = null;
+    scrollJumpState.highlightEl = null;
+    scrollJumpState.startScroll = 0;
+    scrollJumpState.targetScroll = 0;
+    scrollJumpState.startTime = 0;
+    scrollJumpState.duration = 0;
+  }
+
+  function completeScrollJump() {
+    const highlightEl = scrollJumpState.highlightEl || scrollJumpState.anchorEl;
+    if (highlightEl) {
+      highlightElement(highlightEl);
+    }
+    resetScrollJumpState();
+  }
+
+  function rebaseScrollJump(timestamp, target, current) {
+    scrollJumpState.startScroll = current;
+    scrollJumpState.targetScroll = target;
+    scrollJumpState.startTime = timestamp;
+    scrollJumpState.duration = clamp(
+      Math.abs(target - current) * SCROLL_JUMP_SPEED,
+      SCROLL_JUMP_MIN_DURATION,
+      SCROLL_JUMP_MAX_DURATION
+    );
+  }
+
+  function animateScrollJump(timestamp) {
+    if (!scrollJumpState.container || !scrollJumpState.anchorEl) {
+      resetScrollJumpState();
+      return;
+    }
+    const container = scrollJumpState.container;
+    const anchorEl = scrollJumpState.anchorEl;
+    const currentTarget = getCenteredScrollTop(container, anchorEl);
+
+    if (!scrollJumpState.startTime) {
+      rebaseScrollJump(timestamp, currentTarget, getScrollTop(container));
+    } else {
+      const targetDelta = Math.abs(currentTarget - scrollJumpState.targetScroll);
+      if (targetDelta > SCROLL_TARGET_DRIFT) {
+        rebaseScrollJump(timestamp, currentTarget, getScrollTop(container));
+      } else {
+        scrollJumpState.targetScroll = currentTarget;
+      }
+    }
+    const elapsed = timestamp - scrollJumpState.startTime;
+    const progress = clamp(elapsed / scrollJumpState.duration, 0, 1);
+    const ease = 1 - Math.pow(1 - progress, 3);
+    const next = scrollJumpState.startScroll
+      + (scrollJumpState.targetScroll - scrollJumpState.startScroll) * ease;
+    setScrollTop(container, next);
+    if (progress >= 1) {
+      const remaining = Math.abs(scrollJumpState.targetScroll - next);
+      if (remaining <= SCROLL_TARGET_EPSILON) {
+        completeScrollJump();
+        return;
+      }
+      rebaseScrollJump(timestamp, getCenteredScrollTop(container, anchorEl), next);
+    }
+    scrollJumpState.rafId = requestAnimationFrame(animateScrollJump);
+  }
+
+  function scrollElementToCenter(targetEl, highlightEl) {
+    if (!targetEl) {
+      return;
+    }
+    const container = getScrollContainer(targetEl);
+    if (!container) {
+      if (highlightEl) {
+        highlightElement(highlightEl);
+      }
+      return;
+    }
+    resetScrollJumpState();
+    const target = getCenteredScrollTop(container, targetEl);
+    const start = getScrollTop(container);
+    const distance = Math.abs(target - start);
+    scrollJumpState.container = container;
+    scrollJumpState.anchorEl = targetEl;
+    scrollJumpState.highlightEl = highlightEl || targetEl;
+    if (distance < 1) {
+      setScrollTop(container, target);
+      completeScrollJump();
+      return;
+    }
+    rebaseScrollJump(performance.now(), target, start);
+    scrollJumpState.rafId = requestAnimationFrame(animateScrollJump);
   }
 
   function getAnchorItem(list, anchorId) {
@@ -1734,8 +1941,8 @@
       setSelectedAnchorId(anchor.id);
       scrollListToAnchor(anchor.id);
     }
-    anchor.scrollEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    highlightElement(anchor.highlightEl || anchor.scrollEl);
+    const focusEl = anchor.highlightEl || anchor.scrollEl;
+    scrollElementToCenter(focusEl, focusEl);
   }
 
   function highlightElement(element) {
